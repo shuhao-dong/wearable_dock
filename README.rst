@@ -36,3 +36,39 @@ Then navigate to your HOME directory and run::
 
     sudo ./dfu_and_extract
 
+4. Add to System Service
+************************
+
+You need to firstly move the compiled two executables into $PATH::
+
+    sudo install -m 755 ./scan /usr/local/bin/              # This is the BLE receiver executable
+    sudo install -m 755 ./dfu_and_extract /usr/local/bin/   # This is the dock specific executable
+
+Since the BLE receiver codes needs a specified HCI controller index from hciconfig, one needs to install a small launcher script::
+
+    sudo install -m 755 run_scan.sh /usr/local/bin
+
+This will ensure the selected HCI device is always unblocked by rfkill and selected for the BLE receiver executable. 
+
+Then, you will need to copy the two .service files into /etc/systemd/system/, and run::
+
+    sudo systemctl daemon-reload
+    sudo systemctl enable --now scan@1.service  # scan@1 will choose hci1, change accordingly
+    sudo systemctl enable --now dfu_and_extract.service
+
+The two services are now added and started, and will automatically start after each reboot. 
+
+To observe the output from each service, run::
+    
+    journalctl -u scan@1 -f
+
+To stop/start each service, run::
+
+    sudo systemctl stop scan@1
+    sudo systemctl restart scan@1   # Use sudo systemctl status scan@1 to verify current status
+
+To change HCI index::
+
+    sudo systemctl disable scan@1
+    sudo systemctl enable --now scan@0
+ 

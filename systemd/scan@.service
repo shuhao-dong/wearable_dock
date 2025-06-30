@@ -1,0 +1,14 @@
+[Unit]
+Description=Wearable BLE scanner %i
+After=network.target bluetooth.target
+Requires=bluetooth.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/run_scan.sh %i
+Restart=on-failure
+RestartSec=3
+User=root
+
+[Install]
+WantedBy=multi-user.target

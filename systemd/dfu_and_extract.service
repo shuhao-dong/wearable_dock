@@ -1,0 +1,13 @@
+[Unit]
+Description=Wearable Dock Station
+After=local-fs.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/dfu_and_extract
+User=root
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
