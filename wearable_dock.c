@@ -299,6 +299,7 @@ static void convert_and_publish(const char *folder) {
     mosquitto_loop_start(m);
 
     uint8_t buf[RECORD_SIZE]; uint32_t tms; int16_t v[6];
+    int published = 0; 
     while(fread(buf,1,RECORD_SIZE,fp)==RECORD_SIZE){
         memcpy(&tms,buf,4);
         for(int i=0;i<6;i++){
@@ -313,10 +314,9 @@ static void convert_and_publish(const char *folder) {
             v[0]/SCALE, v[1]/SCALE, v[2]/SCALE,
             v[3]/SCALE, v[4]/SCALE, v[5]/SCALE
         );
-        fputs(js, stdout);
-        fflush(stdout);
         mosquitto_publish(m,NULL,MQTT_TOPIC,len,js,0,false);
         usleep(1000);
+        published ++;
     }
 
     mosquitto_loop_stop(m,true);
@@ -324,6 +324,7 @@ static void convert_and_publish(const char *folder) {
     mosquitto_lib_cleanup();
     fclose(fp);
 
+    printf("Published %d IMU records from %s\n", published, folder); 
     /* archive folder */
     mkdir(ARCHIVE_DIR,0755);
     char target[PATH_MAX];

@@ -42,7 +42,7 @@ Then navigate to your HOME directory and run::
 You need to firstly move the compiled two executables into $PATH::
 
     sudo install -m 755 ./scan /usr/local/bin/              # This is the BLE receiver executable
-    sudo install -m 755 ./dfu_and_extract /usr/local/bin/   # This is the dock specific executable
+    sudo install -m 755 ./wearable_dock_run /usr/local/bin/   # This is the dock specific executable
 
 Since the BLE receiver codes needs a specified HCI controller index from hciconfig, one needs to install a small launcher script::
 
@@ -54,7 +54,7 @@ Then, you will need to copy the two .service files into /etc/systemd/system/, an
 
     sudo systemctl daemon-reload
     sudo systemctl enable --now scan@1.service  # scan@1 will choose hci1, change accordingly
-    sudo systemctl enable --now dfu_and_extract.service
+    sudo systemctl enable --now wearable_dock.service
 
 The two services are now added and started, and will automatically start after each reboot. 
 
