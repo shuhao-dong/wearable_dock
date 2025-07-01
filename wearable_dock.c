@@ -2,8 +2,7 @@
  * dfu_extract_publish.c ? DFU + LittleFS extractor + IMU?JSON?MQTT
  *
  * Compile:
- *   cc -std=c11 -Wall -O2 dfu_extract_publish.c -ludev -lmosquitto \
- *      -o ~/dfu_extract_publish
+ *   cc -Wall -O2 wearable_dock.c -ludev -lmosquitto -o ~/wearable_dock_run
  *
  * Needs: libudev-dev, FUSE, littlefs-fuse (lfs), dfu-util ? 0.11, libmosquitto-dev
  */
