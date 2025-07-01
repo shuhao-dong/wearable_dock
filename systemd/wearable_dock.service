@@ -5,6 +5,7 @@ After=local-fs.target
 [Service]
 Type=simple
 ExecStartPre=-/bin/umount -l /mnt/wearable
+
 ExecStart=/usr/local/bin/wearable_dock_run
 User=root
 Restart=on-failure
