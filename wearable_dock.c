@@ -50,7 +50,7 @@
 #define FW_ARCHIVE  "/home/torus-pi5/wearable_dock/new_firmware/archive"
 
 #define BIN_NAME    "imu_log.bin"
-#define BROKER_ADDR "localhost"
+#define BROKER_ADDR "192.168.88.251"
 #define BROKER_PORT 1883
 #define MQTT_TOPIC  "BORUS/extf"
 
