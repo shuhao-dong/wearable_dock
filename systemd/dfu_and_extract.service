@@ -6,6 +6,7 @@ After=local-fs.target
 Type=simple
 ExecStartPre=-/bin/umount -l /mnt/wearable
 ExecStart=/usr/local/bin/dfu_and_extract
+ExecStartPost=/usr/local/bin/run_bin2json.sh
 User=root
 Restart=on-failure
 RestartSec=3
