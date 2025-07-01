@@ -4,6 +4,7 @@ After=local-fs.target
 
 [Service]
 Type=simple
+ExecStartPre=-/bin/umount -l /mnt/wearable
 ExecStart=/usr/local/bin/dfu_and_extract
 User=root
 Restart=on-failure
