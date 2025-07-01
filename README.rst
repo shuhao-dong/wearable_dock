@@ -32,11 +32,11 @@ Before you build the source code, remember to change the broker address and the 
 
 To build the source code, run::
 
-    gcc -std=c11 -Wall -O2 dfu_and_extract.c  -ludev -o ~/dfu_and_extract
+    cc -Wall -O2 wearable_dock.c  -ludev -lmosquitto -o ~/wearable_dock_run
 
 Then navigate to your HOME directory and run::
 
-    sudo ./dfu_and_extract
+    sudo ./wearable_dock_run
 
 4. Add to System Service
 ************************
