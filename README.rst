@@ -28,6 +28,8 @@ Finally, you need to follow `this instructions <https://github.com/littlefs-proj
 3. Running the Programme
 ************************
 
+Before you build the source code, remember to change the broker address and the local host name in the top macros.
+
 To build the source code, run::
 
     gcc -std=c11 -Wall -O2 dfu_and_extract.c  -ludev -o ~/dfu_and_extract
