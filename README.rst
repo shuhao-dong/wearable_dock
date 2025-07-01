@@ -17,7 +17,7 @@ tested on Raspberry Pi 5 and Raspberry Pi Zero 2 W with RPi OS or Ubuntu.
 
 You will need to install the following library before compiling the source code::
 
-    sudo apt-get install build-essential libudev-dev fuse
+    sudo apt-get install build-essential libudev-dev fuse libmosquitto-dev
 
 You have to install dfu-util to perform DFU from application::
 
