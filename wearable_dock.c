@@ -63,7 +63,17 @@ static char current_usb_path[PATH_MAX] = "";
 static volatile sig_atomic_t lfs_pid = -1;
 static volatile sig_atomic_t quit_flag = 0;
 
-// returns 0 on success, -1 on overflow
+/**
+ * @brief Construct the full path to the destination
+ * 
+ * Combines two paths to a single destination path
+ * 
+ * @param a Pointer to path a
+ * @param b Pointer to path b
+ * @param out Pointer to the destination path
+ * 
+ * @return 0 on success -1 on failure
+ */
 static int path_join(const char *a, const char *b, char *out)
 {
     size_t la = strlen(a), lb = strlen(b);
@@ -78,11 +88,50 @@ static int path_join(const char *a, const char *b, char *out)
     return 0;
 }
 
+/**
+ * @brief Get the current time in ms
+ */
 static long now_ms(void)
 {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+/**
+ * @brief Wait for file size to remain unchanged
+ * 
+ * This function will check if the file size provided in the directory remain unchanged before 
+ * proceeding to the next operation. This prevent copying empty file for further processing.
+ * 
+ * @param dir Directory to the file
+ * @param fname File name of the file to check
+ * @param timeout_ms Timeout in ms before 
+ */
+static int wait_for_file(const char *dir, const char *fname, int timeout_ms)
+{
+    char p[PATH_MAX];
+    if (path_join(dir, fname, p) < 0)
+    {
+        return -1; 
+    }
+
+    long end = now_ms() + timeout_ms;
+    struct stat st_prev = {0}, st_now;
+
+    while (now_ms() < end)
+    {
+        if (stat(p, &st_now) == 0 && st_now.st_size > 0)
+        {
+            if (st_now.st_size == st_prev.st_size)
+            {
+                return 0;
+            }
+            st_prev = st_now;
+        }
+        usleep(200 * 1000); // Sleep for 200ms in between 
+    }
+    return -1; 
 }
 
 static int run_child(char *const argv[])
@@ -446,7 +495,17 @@ static void handle_device(struct udev *udev)
 
     /* 4) mount & copy */
     lfs_pid = start_lfs(devnode);
-    sleep(1);
+    
+    if (wait_for_file(MOUNT_POINT, BIN_NAME, 5000) != 0)
+    {
+        fprintf(stderr, "imu_log.bin did not appear within 5s - aborting copy\n");
+        umount_mp(MOUNT_POINT); 
+        waitpid(lfs_pid, NULL, 0);
+        lfs_pid = -1;
+        free(devnode);
+        return; 
+    }
+    
     if (copy_tree(MOUNT_POINT, dest) == 0)
     {
         puts(" -> copied, wiping...");
