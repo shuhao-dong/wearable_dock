@@ -7,10 +7,11 @@ tested on Raspberry Pi 5 and Raspberry Pi Zero 2 W with RPi OS or Ubuntu.
 .. code-block:: none
 
     wearable_dock/
-        |---extracted/                              # Extracted .bin file from the wearable's external flash
-        |       |---timestamped extraction folder   # Timestamped folder with extracted .bin file
-        |---new_firmware/                           # Contains the new firmware to be flashed with DFU
-        |_______|---archive                         # Contains the already flashed old firmware 
+        |___ extracted                               # Extracted binary file from the wearable's external flash
+        |       |___ archive                         # Published binary file backup 
+        |               |___ ts folder/              # Timestamped folder with extracted binary file
+        |___ new_firmware                            # Contains the new firmware to be flashed with DFU
+                |___ archive/                        # Contains the already flashed old firmware 
 
 2. Requirements
 ***************
@@ -28,11 +29,11 @@ Finally, you need to follow `this instructions <https://github.com/littlefs-proj
 3. Running the Programme
 ************************
 
-Before you build the source code, remember to change the broker address and the local host name in the top macros.
+Before you build the source code, _**remember to change the broker address and the local host name in the top macros**_.
 
 To build the source code, run::
 
-    cc -Wall -O2 wearable_dock.c  -ludev -lmosquitto -o ~/wearable_dock_run
+    cc -Wall -O2 wearable_dock.c -ludev -lmosquitto -o ~/wearable_dock_run
 
 Then navigate to your HOME directory and run::
 
@@ -43,7 +44,7 @@ Then navigate to your HOME directory and run::
 
 You need to firstly move the compiled two executables into $PATH::
 
-    sudo install -m 755 ./scan /usr/local/bin/              # This is the BLE receiver executable
+    sudo install -m 755 ./scan /usr/local/bin/                # This is the BLE receiver executable
     sudo install -m 755 ./wearable_dock_run /usr/local/bin/   # This is the dock specific executable
 
 Since the BLE receiver codes needs a specified HCI controller index from hciconfig, one needs to install a small launcher script::
@@ -52,7 +53,7 @@ Since the BLE receiver codes needs a specified HCI controller index from hciconf
 
 This will ensure the selected HCI device is always unblocked by rfkill and selected for the BLE receiver executable. 
 
-Then, you will need to copy the two .service files into /etc/systemd/system/, and run::
+Then, you will need to copy the two service files into /etc/systemd/system/, and run::
 
     sudo systemctl daemon-reload
     sudo systemctl enable --now scan@1.service  # scan@1 will choose hci1, change accordingly

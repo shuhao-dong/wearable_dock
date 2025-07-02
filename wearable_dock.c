@@ -65,13 +65,13 @@ static volatile sig_atomic_t quit_flag = 0;
 
 /**
  * @brief Construct the full path to the destination
- * 
+ *
  * Combines two paths to a single destination path
- * 
+ *
  * @param a Pointer to path a
  * @param b Pointer to path b
  * @param out Pointer to the destination path
- * 
+ *
  * @return 0 on success -1 on failure
  */
 static int path_join(const char *a, const char *b, char *out)
@@ -100,20 +100,20 @@ static long now_ms(void)
 
 /**
  * @brief Wait for file size to remain unchanged
- * 
- * This function will check if the file size provided in the directory remain unchanged before 
+ *
+ * This function will check if the file size provided in the directory remain unchanged before
  * proceeding to the next operation. This prevent copying empty file for further processing.
- * 
+ *
  * @param dir Directory to the file
  * @param fname File name of the file to check
- * @param timeout_ms Timeout in ms before 
+ * @param timeout_ms Timeout in ms before
  */
 static int wait_for_file(const char *dir, const char *fname, int timeout_ms)
 {
     char p[PATH_MAX];
     if (path_join(dir, fname, p) < 0)
     {
-        return -1; 
+        return -1;
     }
 
     long end = now_ms() + timeout_ms;
@@ -129,41 +129,75 @@ static int wait_for_file(const char *dir, const char *fname, int timeout_ms)
             }
             st_prev = st_now;
         }
-        usleep(200 * 1000); // Sleep for 200ms in between 
+        usleep(200 * 1000); // Sleep for 200ms in between
     }
-    return -1; 
+    return -1;
 }
 
+/**
+ * @brief Run a subprocess using process spawning API
+ *
+ * This function will run a subprocess using fork/execvp family
+ *
+ * @param argv Process specific command
+ *
+ * @return 0 on success -1 on failure
+ */
 static int run_child(char *const argv[])
 {
+    /* Copy a child process */
     pid_t pid = fork();
     if (pid < 0)
+    {
         return perror("fork"), -1;
+    }
+
     if (pid == 0)
     {
         execvp(argv[0], argv);
         _exit(127);
     }
+
     int st;
     waitpid(pid, &st, 0);
     return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
 }
 
+/**
+ * @brief Collect child process that has finished
+ *
+ * This function prevents the creation of zombine processes by collecting every child
+ * that has finished
+ *
+ */
 static void reap(int sig)
 {
     (void)sig;
+    /* Check every child, non-blocking */
     while (waitpid(-1, NULL, WNOHANG) > 0)
     {
     }
 }
 
+/**
+ * @brief Stop littlefs-fuse child process when required
+ */
 static void forward_quit(int sig)
 {
     if (lfs_pid > 0)
+    {
         kill(lfs_pid, sig);
+    }
+
     quit_flag = sig;
 }
 
+/**
+ * @brief Callback function when we decend the directory in @ref clear_tree
+ *
+ * This callback function will try to delete everything
+ *
+ */
 static int rm_cb(const char *fpath, const struct stat *sb,
                  int typeflag, struct FTW *ftwbuf)
 {
@@ -174,6 +208,13 @@ static int rm_cb(const char *fpath, const struct stat *sb,
     return remove(fpath);
 }
 
+/**
+ * @brief Decend along the path and perform actions registered in callback
+ *
+ * @param src Path to the directory
+ *
+ * @return 0 on success -1 on failure
+ */
 static int clear_tree(const char *src)
 {
     return nftw(src, rm_cb, 16, FTW_DEPTH | FTW_PHYS);
@@ -181,6 +222,9 @@ static int clear_tree(const char *src)
 
 static char src_root[PATH_MAX], dst_root[PATH_MAX];
 
+/**
+ * @brief Copy files
+ */
 static int copy_file(int in, int out)
 {
     const size_t B = 256 * 1024;
@@ -198,6 +242,9 @@ static int copy_file(int in, int out)
     return r < 0 ? -1 : 0;
 }
 
+/**
+ * @brief Callback function when we decend the directory specified in @ref copy_tree
+ */
 static int cp_cb(const char *f, const struct stat *sb, int flag, struct FTW *p)
 {
     (void)sb;
@@ -223,6 +270,14 @@ static int cp_cb(const char *f, const struct stat *sb, int flag, struct FTW *p)
     return 0;
 }
 
+/**
+ * @brief Decend along the path and copy everything
+ *
+ * @param src Path to the source directory
+ * @param dst Path to the destination directory
+ *
+ * @return 0 on success -1 on failure
+ */
 static int copy_tree(const char *src, const char *dst)
 {
     snprintf(src_root, sizeof src_root, "%s", src);
@@ -230,6 +285,17 @@ static int copy_tree(const char *src, const char *dst)
     return nftw(src, cp_cb, 16, FTW_PHYS);
 }
 
+/**
+ * @brief Enumerate a block device after USB PID VID match
+ *
+ * This function will find a block device providing a match between
+ * target PID VID and detected PID VID within specified time.
+ *
+ * @param u USB device
+ * @param timeout_ms Timeout in ms
+ *
+ * @return the block device of match or NULL
+ */
 static char *find_block_dev(struct udev *u, int timeout_ms)
 {
     long end = now_ms() + timeout_ms;
@@ -267,6 +333,13 @@ static char *find_block_dev(struct udev *u, int timeout_ms)
     return NULL;
 }
 
+/**
+ * @brief Locate the new firmware for DFU
+ *
+ * This function will locate the new firmware under specified directory if there is any
+ *
+ * @return Path to the new firmware
+ */
 static char *next_firmware(void)
 {
     DIR *d = opendir(FW_DIR);
@@ -287,6 +360,16 @@ static char *next_firmware(void)
     return NULL;
 }
 
+/**
+ * @brief Get DFU device's serial number
+ *
+ * Get the current DFU device's serial number to enter DFU mode
+ *
+ * @param ser Pointer to the serial number
+ * @param len Size of the serial number
+ *
+ * @return 0 on success -1 on failure
+ */
 static int get_dfu_serial(char *ser, size_t len)
 {
     int pipefd[2], ok = -1;
@@ -325,15 +408,36 @@ static int get_dfu_serial(char *ser, size_t len)
     return ok;
 }
 
+/**
+ * @brief Perform the DFU proess for the wearable
+ *
+ * This function will reset device into DFU mode and download the new firmware to
+ * the device if there is any
+ *
+ * @param serial Serial number of the device
+ * @param bin Path to the new firmware.bin
+ *
+ * @return 0 on success -1 on failure
+ */
 static int perform_dfu(const char *serial, const char *bin)
 {
+    /* Reset the device to enter DFU mode */
     char *av1[] = {(char *)DFU_UTIL, "-s", (char *)serial, "-e", NULL};
     if (run_child(av1))
+    {
         return fprintf(stderr, "DFU detach failed\n"), -1;
+    }
+
     sleep(2);
+
+    /* Download the new firmware to the device */
     char *av2[] = {(char *)DFU_UTIL, "-a", "1", "-D", (char *)bin, NULL};
     if (run_child(av2))
+    {
         return fprintf(stderr, "DFU download failed\n"), -1;
+    }
+
+    /* Archive the downloaded firmware with download time */
     mkdir(FW_ARCHIVE, 0755);
     char arch[PATH_MAX];
     time_t t = time(NULL);
@@ -348,11 +452,23 @@ static int perform_dfu(const char *serial, const char *bin)
     return 0;
 }
 
+/**
+ * @brief Start a child process to mount the littlefs
+ *
+ * This is equivelant to ./lfs -f <block size etc.> /mnt/wearable. The -f option allows dock programme
+ * to own the helper's PID to prevent zombine process.
+ *
+ * @param dev Device
+ * @return PID of the child process or -1 if don't exist
+ */
 static pid_t start_lfs(const char *dev)
 {
     pid_t pid = fork();
     if (pid < 0)
+    {
         return -1;
+    }
+
     if (!pid)
     {
         char *dup = strdup(LFS_ARGS);
@@ -361,29 +477,44 @@ static pid_t start_lfs(const char *dev)
         argv[i++] = (char *)LFS_BIN;
         argv[i++] = "-f";
         for (char *t = strtok(dup, " "); t; t = strtok(NULL, " "))
+        {
             argv[i++] = t;
+        }
         argv[i++] = (char *)dev;
         argv[i++] = MOUNT_POINT;
         argv[i] = NULL;
+
         execv(argv[0], argv);
         _exit(127);
     }
     return pid;
 }
 
+/* Check if littls-fuse is mounted */
 static int is_fuse_mounted(const char *mp)
 {
     struct statfs s;
     return statfs(mp, &s) == 0 && s.f_type == FUSE_SUPER_MAGIC;
 }
+
+/* Unmount the mounted device */
 static int umount_mp(const char *mp)
 {
     char *av[] = {"umount", (char *)mp, NULL};
     return run_child(av);
 }
 
+/**
+ * @brief Convert extracted binary to JSON and publish via MQTT
+ *
+ * This function will convert the binary file to a JSON structure and publish
+ * via MQTT to a specified broker in an asynchronous way.
+ *
+ * @param folder Path to the extracted binary file
+ */
 static void convert_and_publish(const char *folder)
 {
+    /* Locate the binary file */
     char binpath[PATH_MAX];
     if (path_join(folder, BIN_NAME, binpath) < 0)
     {
@@ -397,6 +528,7 @@ static void convert_and_publish(const char *folder)
         return;
     }
 
+    /* Initialise MQTT */
     mosquitto_lib_init();
     struct mosquitto *m = mosquitto_new(NULL, true, NULL);
     if (!m || mosquitto_connect_async(m, BROKER_ADDR, BROKER_PORT, 60))
@@ -437,14 +569,20 @@ static void convert_and_publish(const char *folder)
     fclose(fp);
 
     printf("Published %d IMU records from %s\n", published, folder);
+
     /* archive folder */
     mkdir(ARCHIVE_DIR, 0755);
     char target[PATH_MAX];
     const char *name = strrchr(folder, '/');
     if (!name)
+    {
         name = folder;
+    }
     else
+    {
         name++;
+    }
+
     if (path_join(ARCHIVE_DIR, name, target) < 0)
     {
         fprintf(stderr, "archive path too long: \"%s/%s\"\n", ARCHIVE_DIR, name);
@@ -452,10 +590,21 @@ static void convert_and_publish(const char *folder)
     else
     {
         if (rename(folder, target) < 0)
+        {
             perror("rename to archive");
+        }
     }
 }
 
+/**
+ * @brief Integrate all operations regarding to the wearable device
+ *
+ * This function will perform DFU if new firmware available, extract binary file from external flash
+ * and publish them to the specified broker via MQTT.
+ *
+ * @param udev USB device
+ *
+ */
 static void handle_device(struct udev *udev)
 {
     /* 1) DFU upgrade if any */
@@ -469,14 +618,20 @@ static void handle_device(struct udev *udev)
             perform_dfu(serial, fw);
         }
         else
+        {
             fprintf(stderr, "!! skip DFU\n");
+        }
+
         free(fw);
     }
 
     /* 2) find block device */
     char *devnode = NULL;
     for (int i = 0; i < 30 && !devnode; i++)
+    {
         devnode = find_block_dev(udev, 500);
+    }
+        
     if (!devnode)
     {
         fprintf(stderr, "!! no block dev\n");
@@ -495,17 +650,17 @@ static void handle_device(struct udev *udev)
 
     /* 4) mount & copy */
     lfs_pid = start_lfs(devnode);
-    
+
     if (wait_for_file(MOUNT_POINT, BIN_NAME, 5000) != 0)
     {
         fprintf(stderr, "imu_log.bin did not appear within 5s - aborting copy\n");
-        umount_mp(MOUNT_POINT); 
+        umount_mp(MOUNT_POINT);
         waitpid(lfs_pid, NULL, 0);
         lfs_pid = -1;
         free(devnode);
-        return; 
+        return;
     }
-    
+
     if (copy_tree(MOUNT_POINT, dest) == 0)
     {
         puts(" -> copied, wiping...");
@@ -516,7 +671,9 @@ static void handle_device(struct udev *udev)
         fprintf(stderr, "X copy error\n");
     }
     if (is_fuse_mounted(MOUNT_POINT))
+    {
         umount_mp(MOUNT_POINT);
+    }
     waitpid(lfs_pid, NULL, 0);
     lfs_pid = -1;
 
@@ -543,8 +700,7 @@ int main(void)
     while (!quit_flag)
     {
         /* debounce removal */
-        if (debouncing && remove_seen_at_ms > 0 &&
-            now_ms() - remove_seen_at_ms > 500)
+        if (debouncing && remove_seen_at_ms > 0 && now_ms() - remove_seen_at_ms > 500)
         {
             debouncing = 0;
             current_usb_path[0] = 0;
@@ -553,12 +709,16 @@ int main(void)
 
         struct pollfd pfd = {fd, POLLIN, 0};
         if (poll(&pfd, 1, 1000) <= 0)
+        {
             continue;
-
+        }
+        
         struct udev_device *dev = udev_monitor_receive_device(mon);
         if (!dev)
+        {
             continue;
-
+        }
+    
         const char *act = udev_device_get_action(dev),
                    *vid = udev_device_get_sysattr_value(dev, "idVendor"),
                    *pid = udev_device_get_sysattr_value(dev, "idProduct"),
