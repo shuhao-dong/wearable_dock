@@ -204,7 +204,13 @@ static int rm_cb(const char *fpath, const struct stat *sb,
     (void)sb;
     (void)ftwbuf;
     if (typeflag == FTW_DP)
+    {
+        if (strcmp(fpath, MOUNT_POINT) == 0)
+        {
+            return 0;
+        }
         return rmdir(fpath);
+    }
     return remove(fpath);
 }
 
@@ -476,6 +482,8 @@ static pid_t start_lfs(const char *dev)
         int i = 0;
         argv[i++] = (char *)LFS_BIN;
         argv[i++] = "-f";
+        argv[i++] = "-o"; 
+        argv[i++] = "ro"; 
         for (char *t = strtok(dup, " "); t; t = strtok(NULL, " "))
         {
             argv[i++] = t;
@@ -596,6 +604,24 @@ static void convert_and_publish(const char *folder)
     }
 }
 
+static void wait_for_clean_mountpoint(void)
+{
+    if (lfs_pid > 0)
+    {
+        int status;
+        for (int i = 0; i < 50 && waitpid(lfs_pid, &status, WNOHANG) == 0; i++)
+        {
+            usleep(100000); 
+        }
+        lfs_pid = -1; 
+    }
+
+    for (int i = 0; i < 50 && is_fuse_mounted(MOUNT_POINT); i++)
+    {
+        usleep(100000); 
+    }
+}
+
 /**
  * @brief Integrate all operations regarding to the wearable device
  *
@@ -646,7 +672,22 @@ static void handle_device(struct udev *udev)
     strftime(dest, sizeof dest, DEST_BASE "/%Y%m%d_%H%M%S", &tm);
     mkdir(DEST_BASE, 0755);
     mkdir(dest, 0755);
-    mkdir(MOUNT_POINT, 0755);
+
+    struct stat st;
+    if (lstat(MOUNT_POINT, &st) == 0)
+    {
+        if (!S_ISDIR(st.st_mode))
+        {
+            unlink(MOUNT_POINT);
+            mkdir(MOUNT_POINT, 0755); 
+        }
+    }
+    else
+    {
+        mkdir(MOUNT_POINT, 0755); 
+    }
+
+    wait_for_clean_mountpoint(); 
 
     /* 4) mount & copy */
     lfs_pid = start_lfs(devnode);
@@ -655,8 +696,7 @@ static void handle_device(struct udev *udev)
     {
         fprintf(stderr, "imu_log.bin did not appear within 5s - aborting copy\n");
         umount_mp(MOUNT_POINT);
-        waitpid(lfs_pid, NULL, 0);
-        lfs_pid = -1;
+        wait_for_clean_mountpoint(); 
         free(devnode);
         return;
     }
@@ -673,9 +713,8 @@ static void handle_device(struct udev *udev)
     if (is_fuse_mounted(MOUNT_POINT))
     {
         umount_mp(MOUNT_POINT);
+        wait_for_clean_mountpoint(); 
     }
-    waitpid(lfs_pid, NULL, 0);
-    lfs_pid = -1;
 
     free(devnode);
 
