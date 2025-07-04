@@ -1,3 +1,8 @@
-extracted
-new_firmware
+extracted/
+new_firmware/
+
+*.o
+*.d
+*.a
+wearable_dock_run
 
