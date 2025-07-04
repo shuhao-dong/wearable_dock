@@ -192,40 +192,6 @@ static void forward_quit(int sig)
     quit_flag = sig;
 }
 
-/**
- * @brief Callback function when we decend the directory in @ref clear_tree
- *
- * This callback function will try to delete everything
- *
- */
-static int rm_cb(const char *fpath, const struct stat *sb,
-                 int typeflag, struct FTW *ftwbuf)
-{
-    (void)sb;
-    (void)ftwbuf;
-    if (typeflag == FTW_DP)
-    {
-        if (strcmp(fpath, MOUNT_POINT) == 0)
-        {
-            return 0;
-        }
-        return rmdir(fpath);
-    }
-    return remove(fpath);
-}
-
-/**
- * @brief Decend along the path and perform actions registered in callback
- *
- * @param src Path to the directory
- *
- * @return 0 on success -1 on failure
- */
-static int clear_tree(const char *src)
-{
-    return nftw(src, rm_cb, 16, FTW_DEPTH | FTW_PHYS);
-}
-
 static char src_root[PATH_MAX], dst_root[PATH_MAX];
 
 /**
@@ -701,15 +667,11 @@ static void handle_device(struct udev *udev)
         return;
     }
 
-    if (copy_tree(MOUNT_POINT, dest) == 0)
+    if (copy_tree(MOUNT_POINT, dest) != 0)
     {
-        puts(" -> copied, wiping...");
-        clear_tree(MOUNT_POINT);
+        fprintf(stderr, " X copy error\n"); 
     }
-    else
-    {
-        fprintf(stderr, "X copy error\n");
-    }
+
     if (is_fuse_mounted(MOUNT_POINT))
     {
         umount_mp(MOUNT_POINT);
