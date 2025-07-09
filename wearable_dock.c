@@ -394,7 +394,7 @@ static int get_dfu_serial(char *ser, size_t len)
 static int perform_dfu(const char *serial, const char *bin)
 {
     /* Reset the device to enter DFU mode */
-    char *av1[] = {(char *)DFU_UTIL, "-s", (char *)serial, "-e", NULL};
+    char *av1[] = {(char *)DFU_UTIL, "-S", (char *)serial, "-e", NULL};
     if (run_child(av1))
     {
         return fprintf(stderr, "DFU detach failed\n"), -1;
@@ -403,7 +403,7 @@ static int perform_dfu(const char *serial, const char *bin)
     sleep(2);
 
     /* Download the new firmware to the device */
-    char *av2[] = {(char *)DFU_UTIL, "-a", "1", "-D", (char *)bin, NULL};
+    char *av2[] = {(char *)DFU_UTIL, "-S", (char *)serial, "-a", "1", "-D", (char *)bin, NULL};
     if (run_child(av2))
     {
         return fprintf(stderr, "DFU download failed\n"), -1;
