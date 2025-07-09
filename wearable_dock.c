@@ -333,54 +333,6 @@ static char *next_firmware(void)
 }
 
 /**
- * @brief Get DFU device's serial number
- *
- * Get the current DFU device's serial number to enter DFU mode
- *
- * @param ser Pointer to the serial number
- * @param len Size of the serial number
- *
- * @return 0 on success -1 on failure
- */
-static int get_dfu_serial(char *ser, size_t len)
-{
-    int pipefd[2], ok = -1;
-    if (pipe(pipefd))
-        return -1;
-    pid_t pid = fork();
-    if (pid < 0)
-        return -1;
-    if (!pid)
-    {
-        dup2(pipefd[1], 1);
-        close(pipefd[0]);
-        execl(DFU_UTIL, DFU_UTIL, "-l", NULL);
-        _exit(127);
-    }
-    close(pipefd[1]);
-    FILE *fp = fdopen(pipefd[0], "r");
-    if (fp)
-    {
-        char line[512];
-        while (fgets(line, sizeof line, fp))
-        {
-            if (strstr(line, VENDOR_ID) && strstr(line, PRODUCT_ID) && strstr(line, "serial="))
-            {
-                char *s = strstr(line, "serial=") + 7;
-                strtok(s, " \r\n");
-                strncpy(ser, s, len - 1);
-                ser[len - 1] = 0;
-                ok = 0;
-                break;
-            }
-        }
-        fclose(fp);
-    }
-    waitpid(pid, NULL, 0);
-    return ok;
-}
-
-/**
  * @brief Perform the DFU proess for the wearable
  *
  * This function will reset device into DFU mode and download the new firmware to
@@ -391,19 +343,10 @@ static int get_dfu_serial(char *ser, size_t len)
  *
  * @return 0 on success -1 on failure
  */
-static int perform_dfu(const char *serial, const char *bin)
+static int perform_dfu(const char *bin)
 {
-    /* Reset the device to enter DFU mode */
-    char *av1[] = {(char *)DFU_UTIL, "-S", (char *)serial, "-e", NULL};
-    if (run_child(av1))
-    {
-        return fprintf(stderr, "DFU detach failed\n"), -1;
-    }
-
-    sleep(2);
-
     /* Download the new firmware to the device */
-    char *av2[] = {(char *)DFU_UTIL, "-S", (char *)serial, "-a", "1", "-D", (char *)bin, NULL};
+    char *av2[] = {(char *)DFU_UTIL, "-a", "1", "-D", (char *)bin, NULL};
     if (run_child(av2))
     {
         return fprintf(stderr, "DFU download failed\n"), -1;
@@ -603,16 +546,10 @@ static void handle_device(struct udev *udev)
     char *fw = next_firmware();
     if (fw)
     {
-        char serial[128];
-        if (get_dfu_serial(serial, sizeof serial) == 0)
-        {
-            puts("-> Firmware found, running DFU...");
-            perform_dfu(serial, fw);
-        }
-        else
-        {
-            fprintf(stderr, "!! skip DFU\n");
-        }
+
+        puts("-> Firmware found, running DFU...");
+
+        perform_dfu(fw);
 
         free(fw);
     }
