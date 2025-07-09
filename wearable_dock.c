@@ -346,7 +346,7 @@ static char *next_firmware(void)
 static int perform_dfu(const char *bin)
 {
     /* Download the new firmware to the device */
-    char *av2[] = {(char *)DFU_UTIL, "-a", "1", "-D", (char *)bin, NULL};
+    char *av2[] = {(char *)DFU_UTIL, "-a", "1", "-t", "1024", "-D", (char *)bin, NULL};
     if (run_child(av2))
     {
         return fprintf(stderr, "DFU download failed\n"), -1;
@@ -558,7 +558,7 @@ static void handle_device(struct udev *udev)
     char *devnode = NULL;
     for (int i = 0; i < 30 && !devnode; i++)
     {
-        devnode = find_block_dev(udev, 500);
+        devnode = find_block_dev(udev, 2000);
     }
         
     if (!devnode)
