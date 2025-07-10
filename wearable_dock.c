@@ -2,7 +2,7 @@
  * wearable_dock.c: DFU + LittleFS extractor + IMU to JSON to MQTT
  *
  * Compile:
- *   cc -Wall -O2 wearable_dock.c -ludev -lmosquitto -o ~/wearable_dock_run
+ *   cc -Wall -O2 wearable_dock.c -ludev -lmosquitto -o wearable_dock_run
  *
  * Needs: libudev-dev, FUSE, littlefs-fuse (lfs), dfu-util, libmosquitto-dev
  */
@@ -346,7 +346,7 @@ static char *next_firmware(void)
 static int perform_dfu(const char *bin)
 {
     /* Download the new firmware to the device */
-    char *av2[] = {(char *)DFU_UTIL, "-a", "1", "-t", "1024", "-D", (char *)bin, NULL};
+    char *av2[] = {(char *)DFU_UTIL, "-a", "1", "-D", (char *)bin, NULL};
     if (run_child(av2))
     {
         return fprintf(stderr, "DFU download failed\n"), -1;
