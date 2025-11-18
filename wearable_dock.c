@@ -1,684 +1,763 @@
 /*
- * wearable_dock.c: DFU + LittleFS extractor + IMU to JSON to MQTT
+ * wearable_dock.c: exFAT logs extractor + IMU to JSON to MQTT
  *
  * Compile:
  *   cc -Wall -O2 wearable_dock.c -ludev -lmosquitto -o wearable_dock_run
- *
- * Needs: libudev-dev, FUSE, littlefs-fuse (lfs), dfu-util, libmosquitto-dev
  */
 
 #define _GNU_SOURCE
+#include <errno.h>
 #include <fcntl.h>
-#include <ftw.h>
 #include <libudev.h>
+#include <mosquitto.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdio.h>
+#include <stdint.h>
+#include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
-#include <sys/statfs.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 #include <dirent.h>
-#include <mosquitto.h>
-#include <errno.h>
+#include <limits.h>
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096
 #endif
-#ifndef FUSE_SUPER_MAGIC
-#define FUSE_SUPER_MAGIC 0x65735546
-#endif
 
-/* Runtime configuration */
-#define VENDOR_ID "0001"
-#define PRODUCT_ID "0001"
+/* USB ID of your wearable MSC device */
+#define WEARABLE_VENDOR_HEX "0001"
+#define WEARABLE_PRODUCT_HEX "0001"
 
-#define LFS_BIN "/home/torus-pi5/littlefs-fuse/lfs"
-#define LFS_ARGS "--block_count=1760 --block_size=4096 --read_size=16 " \
-                 "--prog_size=16 --cache_size=64 --lookahead_size=32"
-
+/* Where we mount the wearable’s exFAT volume (no GUI / spaces) */
 #define MOUNT_POINT "/mnt/wearable"
-#define DEST_BASE "/home/torus-pi5/wearable_dock/extracted"
-#define ARCHIVE_DIR DEST_BASE "/archive"
 
-#define DFU_UTIL "/usr/bin/dfu-util"
-#define FW_DIR "/home/torus-pi5/wearable_dock/new_firmware"
-#define FW_ARCHIVE "/home/torus-pi5/wearable_dock/new_firmware/archive"
+/* Where to store offloaded sessions */
+#define SESSIONS_BASE "/home/torus-4/wearable_dock/extracted"
+#define ARCHIVE_BASE SESSIONS_BASE "/archive"
 
-#define BIN_NAME "imu_log.bin"
-#define BROKER_ADDR "192.168.88.251"
-#define BROKER_PORT 1883
+/* Subdirectory created by firmware on the card */
+#define LOGS_SUBDIR "logs"
+
+/* MQTT configuration */
+#define MQTT_HOST "192.168.88.251"
+#define MQTT_PORT 1883
 #define MQTT_TOPIC "BORUS/extf"
 
-#define RECORD_SIZE (4 + 6 * 2)
-#define SCALE 100.0f
+/* Binary record from firmware:
+ *   uint32_t timestamp_ms;
+ *   uint32_t pressure_pa;
+ *   int16_t  imu[6];
+ */
+#define RECORD_SIZE (4 + 4 + 6 * 2)
+#define IMU_SCALE 100.0f
 
-static int debouncing = 0;
-static long remove_seen_at_ms = 0;
-static char current_usb_path[PATH_MAX] = "";
-static volatile sig_atomic_t lfs_pid = -1;
 static volatile sig_atomic_t quit_flag = 0;
 
-/**
- * @brief Construct the full path to the destination
- *
- * Combines two paths to a single destination path
- *
- * @param a Pointer to path a
- * @param b Pointer to path b
- * @param out Pointer to the destination path
- *
- * @return 0 on success -1 on failure
- */
-static int path_join(const char *a, const char *b, char *out)
+/* ======================== SIGNAL HANDLER ========================= */
+
+static void handle_sigint(int sig)
 {
-    size_t la = strlen(a), lb = strlen(b);
-    if (la + 1 + lb >= PATH_MAX)
+    (void)sig;
+    quit_flag = 1;
+}
+
+/* ========================= SMALL HELPERS ========================= */
+
+static int join_path(const char *a, const char *b, char *out, size_t out_sz)
+{
+    int n = snprintf(out, out_sz, "%s/%s", a, b);
+    if (n < 0 || (size_t)n >= out_sz)
     {
+        errno = ENAMETOOLONG;
         return -1;
     }
-    memcpy(out, a, la);
-    out[la] = '/';
-    memcpy(out + la + 1, b, lb);
-    out[la + 1 + lb] = '\0';
     return 0;
 }
 
-/**
- * @brief Get the current time in ms
- */
-static long now_ms(void)
+static int ensure_dir(const char *path)
 {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
-}
-
-/**
- * @brief Wait for file size to remain unchanged
- *
- * This function will check if the file size provided in the directory remain unchanged before
- * proceeding to the next operation. This prevent copying empty file for further processing.
- *
- * @param dir Directory to the file
- * @param fname File name of the file to check
- * @param timeout_ms Timeout in ms before
- */
-static int wait_for_file(const char *dir, const char *fname, int timeout_ms)
-{
-    char p[PATH_MAX];
-    if (path_join(dir, fname, p) < 0)
+    if (mkdir(path, 0755) == -1)
     {
+        if (errno == EEXIST)
+        {
+            return 0;
+        }
+        perror(path);
         return -1;
     }
-
-    long end = now_ms() + timeout_ms;
-    struct stat st_prev = {0}, st_now;
-
-    while (now_ms() < end)
-    {
-        if (stat(p, &st_now) == 0 && st_now.st_size > 0)
-        {
-            if (st_now.st_size == st_prev.st_size)
-            {
-                return 0;
-            }
-            st_prev = st_now;
-        }
-        usleep(200 * 1000); // Sleep for 200ms in between
-    }
-    return -1;
+    return 0;
 }
 
-/**
- * @brief Run a subprocess using process spawning API
- *
- * This function will run a subprocess using fork/execvp family
- *
- * @param argv Process specific command
- *
- * @return 0 on success -1 on failure
- */
 static int run_child(char *const argv[])
 {
-    /* Copy a child process */
     pid_t pid = fork();
     if (pid < 0)
     {
-        return perror("fork"), -1;
+        perror("fork");
+        return -1;
     }
-
     if (pid == 0)
     {
         execvp(argv[0], argv);
         _exit(127);
     }
-
     int st;
-    waitpid(pid, &st, 0);
-    return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
-}
-
-/**
- * @brief Collect child process that has finished
- *
- * This function prevents the creation of zombine processes by collecting every child
- * that has finished
- *
- */
-static void reap(int sig)
-{
-    (void)sig;
-    /* Check every child, non-blocking */
-    while (waitpid(-1, NULL, WNOHANG) > 0)
+    if (waitpid(pid, &st, 0) < 0)
     {
-    }
-}
-
-/**
- * @brief Stop littlefs-fuse child process when required
- */
-static void forward_quit(int sig)
-{
-    if (lfs_pid > 0)
-    {
-        kill(lfs_pid, sig);
-    }
-
-    quit_flag = sig;
-}
-
-static char src_root[PATH_MAX], dst_root[PATH_MAX];
-
-/**
- * @brief Copy files
- */
-static int copy_file(int in, int out)
-{
-    const size_t B = 256 * 1024;
-    char *buf = malloc(B);
-    if (!buf)
+        perror("waitpid");
         return -1;
-    ssize_t r;
-    while ((r = read(in, buf, B)) > 0)
-        if (write(out, buf, r) != r)
-        {
-            r = -1;
-            break;
-        }
-    free(buf);
-    return r < 0 ? -1 : 0;
+    }
+    if (WIFEXITED(st))
+    {
+        return WEXITSTATUS(st);
+    }
+    return -1;
 }
 
-/**
- * @brief Callback function when we decend the directory specified in @ref copy_tree
- */
-static int cp_cb(const char *f, const struct stat *sb, int flag, struct FTW *p)
+static int make_session_dir(char *session_dir, size_t sz)
 {
-    (void)sb;
-    (void)p;
-    char dst[PATH_MAX];
-    snprintf(dst, sizeof dst, "%s%s", dst_root, f + strlen(src_root));
-    if (flag == FTW_D)
-    {
-        mkdir(dst, 0755);
-        return 0;
-    }
-    else if (flag == FTW_F)
-    {
-        int in = open(f, O_RDONLY),
-            out = open(dst, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-        if (in < 0 || out < 0)
-            return perror("open"), -1;
-        int rc = copy_file(in, out);
-        close(in);
-        close(out);
-        return rc;
-    }
-    return 0;
-}
-
-/**
- * @brief Decend along the path and copy everything
- *
- * @param src Path to the source directory
- * @param dst Path to the destination directory
- *
- * @return 0 on success -1 on failure
- */
-static int copy_tree(const char *src, const char *dst)
-{
-    snprintf(src_root, sizeof src_root, "%s", src);
-    snprintf(dst_root, sizeof dst_root, "%s", dst);
-    return nftw(src, cp_cb, 16, FTW_PHYS);
-}
-
-/**
- * @brief Enumerate a block device after USB PID VID match
- *
- * This function will find a block device providing a match between
- * target PID VID and detected PID VID within specified time.
- *
- * @param u USB device
- * @param timeout_ms Timeout in ms
- *
- * @return the block device of match or NULL
- */
-static char *find_block_dev(struct udev *u, int timeout_ms)
-{
-    long end = now_ms() + timeout_ms;
-    while (now_ms() < end)
-    {
-        struct udev_enumerate *en = udev_enumerate_new(u);
-        udev_enumerate_add_match_subsystem(en, "block");
-        udev_enumerate_add_match_property(en, "DEVTYPE", "disk");
-        udev_enumerate_scan_devices(en);
-        struct udev_list_entry *list = udev_enumerate_get_list_entry(en), *e;
-        udev_list_entry_foreach(e, list)
-        {
-            const char *path = udev_list_entry_get_name(e);
-            struct udev_device *blk = udev_device_new_from_syspath(u, path);
-            struct udev_device *usb = udev_device_get_parent_with_subsystem_devtype(
-                blk, "usb", "usb_device");
-            const char *vid = usb ? udev_device_get_sysattr_value(usb, "idVendor") : NULL;
-            const char *pid = usb ? udev_device_get_sysattr_value(usb, "idProduct") : NULL;
-            if (vid && pid && !strcmp(vid, VENDOR_ID) && !strcmp(pid, PRODUCT_ID))
-            {
-                const char *node = udev_device_get_devnode(blk);
-                if (node)
-                {
-                    char *ret = strdup(node);
-                    udev_enumerate_unref(en);
-                    udev_device_unref(blk);
-                    return ret;
-                }
-            }
-            udev_device_unref(blk);
-        }
-        udev_enumerate_unref(en);
-        usleep(250000);
-    }
-    return NULL;
-}
-
-/**
- * @brief Locate the new firmware for DFU
- *
- * This function will locate the new firmware under specified directory if there is any
- *
- * @return Path to the new firmware
- */
-static char *next_firmware(void)
-{
-    DIR *d = opendir(FW_DIR);
-    if (!d)
-        return NULL;
-    struct dirent *e;
-    char path[PATH_MAX];
-    while ((e = readdir(d)))
-    {
-        if (strstr(e->d_name, ".bin") && !strstr(e->d_name, ".bin.done"))
-        {
-            snprintf(path, sizeof path, "%s/%s", FW_DIR, e->d_name);
-            closedir(d);
-            return strdup(path);
-        }
-    }
-    closedir(d);
-    return NULL;
-}
-
-/**
- * @brief Perform the DFU proess for the wearable
- *
- * This function will reset device into DFU mode and download the new firmware to
- * the device if there is any
- *
- * @param serial Serial number of the device
- * @param bin Path to the new firmware.bin
- *
- * @return 0 on success -1 on failure
- */
-static int perform_dfu(const char *bin)
-{
-    /* Download the new firmware to the device */
-    char *av2[] = {(char *)DFU_UTIL, "-a", "1", "-D", (char *)bin, NULL};
-    if (run_child(av2))
-    {
-        return fprintf(stderr, "DFU download failed\n"), -1;
-    }
-
-    /* Archive the downloaded firmware with download time */
-    mkdir(FW_ARCHIVE, 0755);
-    char arch[PATH_MAX];
-    time_t t = time(NULL);
+    time_t now = time(NULL);
     struct tm tm;
-    localtime_r(&t, &tm);
-    strftime(arch, sizeof arch, FW_ARCHIVE "/%Y%m%d_%H%M%S.bin", &tm);
-    if (rename(bin, arch))
-    {
-        perror("rename firmware");
-        unlink(bin);
-    }
-    return 0;
-}
+    localtime_r(&now, &tm);
 
-/**
- * @brief Start a child process to mount the littlefs
- *
- * This is equivelant to ./lfs -f <block size etc.> /mnt/wearable. The -f option allows dock programme
- * to own the helper's PID to prevent zombine process.
- *
- * @param dev Device
- * @return PID of the child process or -1 if don't exist
- */
-static pid_t start_lfs(const char *dev)
-{
-    pid_t pid = fork();
-    if (pid < 0)
+    char stamp[32];
+    if (!strftime(stamp, sizeof(stamp), "%Y%m%d_%H%M%S", &tm))
+    {
+        fprintf(stderr, "strftime failed\n");
+        return -1;
+    }
+
+    if (ensure_dir(SESSIONS_BASE) != 0)
     {
         return -1;
     }
 
-    if (!pid)
+    int n = snprintf(session_dir, sz, "%s/%s", SESSIONS_BASE, stamp);
+    if (n < 0 || (size_t)n >= sz)
     {
-        char *dup = strdup(LFS_ARGS);
-        char *argv[32];
-        int i = 0;
-        argv[i++] = (char *)LFS_BIN;
-        argv[i++] = "-f";
-        argv[i++] = "-o"; 
-        argv[i++] = "ro"; 
-        for (char *t = strtok(dup, " "); t; t = strtok(NULL, " "))
-        {
-            argv[i++] = t;
-        }
-        argv[i++] = (char *)dev;
-        argv[i++] = MOUNT_POINT;
-        argv[i] = NULL;
-
-        execv(argv[0], argv);
-        _exit(127);
+        errno = ENAMETOOLONG;
+        return -1;
     }
-    return pid;
+
+    if (ensure_dir(session_dir) != 0)
+    {
+        return -1;
+    }
+    return 0;
 }
 
-/* Check if littls-fuse is mounted */
-static int is_fuse_mounted(const char *mp)
-{
-    struct statfs s;
-    return statfs(mp, &s) == 0 && s.f_type == FUSE_SUPER_MAGIC;
-}
+/* ====================== MOUNT / UNMOUNT HELPERS ================== */
 
-/* Unmount the mounted device */
-static int umount_mp(const char *mp)
+static void ensure_unmounted(const char *mp)
 {
     char *av[] = {"umount", (char *)mp, NULL};
-    return run_child(av);
+    (void)run_child(av); /* ignore errors */
 }
 
-/**
- * @brief Convert extracted binary to JSON and publish via MQTT
- *
- * This function will convert the binary file to a JSON structure and publish
- * via MQTT to a specified broker in an asynchronous way.
- *
- * @param folder Path to the extracted binary file
- */
-static void convert_and_publish(const char *folder)
+static int mount_exfat(const char *disk_devnode, char *out_dev, size_t out_sz)
 {
-    /* Locate the binary file */
-    char binpath[PATH_MAX];
-    if (path_join(folder, BIN_NAME, binpath) < 0)
-    {
-        fprintf(stderr, "path too long: \"%s/%s\"\n", folder, BIN_NAME);
-        return;
-    }
-    FILE *fp = fopen(binpath, "rb");
-    if (!fp)
-    {
-        perror(binpath);
-        return;
-    }
-
-    /* Initialise MQTT */
-    mosquitto_lib_init();
-    struct mosquitto *m = mosquitto_new(NULL, true, NULL);
-    if (!m || mosquitto_connect_async(m, BROKER_ADDR, BROKER_PORT, 60))
-    {
-        fprintf(stderr, "MQTT init failed\n");
-        fclose(fp);
-        return;
-    }
-    mosquitto_loop_start(m);
-
-    uint8_t buf[RECORD_SIZE];
-    uint32_t tms;
-    int16_t v[6];
-    int published = 0;
-    while (fread(buf, 1, RECORD_SIZE, fp) == RECORD_SIZE)
-    {
-        memcpy(&tms, buf, 4);
-        for (int i = 0; i < 6; i++)
-        {
-            memcpy(&v[i], buf + 4 + i * 2, 2);
-        }
-        char js[512];
-        int len = snprintf(js, sizeof js,
-                           "{\"timestamp_ms\":%u,"
-                           "\"acceleration\":[%.2f,%.2f,%.2f],"
-                           "\"gyroscope\":[%.2f,%.2f,%.2f]}",
-                           tms,
-                           v[0] / SCALE, v[1] / SCALE, v[2] / SCALE,
-                           v[3] / SCALE, v[4] / SCALE, v[5] / SCALE);
-        mosquitto_publish(m, NULL, MQTT_TOPIC, len, js, 0, false);
-        usleep(1000);
-        published++;
-    }
-
-    mosquitto_loop_stop(m, true);
-    mosquitto_destroy(m);
-    mosquitto_lib_cleanup();
-    fclose(fp);
-
-    printf("Published %d IMU records from %s\n", published, folder);
-
-    /* archive folder */
-    mkdir(ARCHIVE_DIR, 0755);
-    char target[PATH_MAX];
-    const char *name = strrchr(folder, '/');
-    if (!name)
-    {
-        name = folder;
-    }
-    else
-    {
-        name++;
-    }
-
-    if (path_join(ARCHIVE_DIR, name, target) < 0)
-    {
-        fprintf(stderr, "archive path too long: \"%s/%s\"\n", ARCHIVE_DIR, name);
-    }
-    else
-    {
-        if (rename(folder, target) < 0)
-        {
-            perror("rename to archive");
-        }
-    }
-}
-
-static void wait_for_clean_mountpoint(void)
-{
-    if (lfs_pid > 0)
-    {
-        int status;
-        for (int i = 0; i < 50 && waitpid(lfs_pid, &status, WNOHANG) == 0; i++)
-        {
-            usleep(100000); 
-        }
-        lfs_pid = -1; 
-    }
-
-    for (int i = 0; i < 50 && is_fuse_mounted(MOUNT_POINT); i++)
-    {
-        usleep(100000); 
-    }
-}
-
-/**
- * @brief Integrate all operations regarding to the wearable device
- *
- * This function will perform DFU if new firmware available, extract binary file from external flash
- * and publish them to the specified broker via MQTT.
- *
- * @param udev USB device
- *
- */
-static void handle_device(struct udev *udev)
-{
-    /* 1) DFU upgrade if any */
-    char *fw = next_firmware();
-    if (fw)
-    {
-
-        puts("-> Firmware found, running DFU...");
-
-        perform_dfu(fw);
-
-        free(fw);
-    }
-
-    /* 2) find block device */
-    char *devnode = NULL;
-    for (int i = 0; i < 30 && !devnode; i++)
-    {
-        devnode = find_block_dev(udev, 2000);
-    }
-        
-    if (!devnode)
-    {
-        fprintf(stderr, "!! no block dev\n");
-        return;
-    }
-
-    /* 3) prepare destination */
-    time_t tt = time(NULL);
-    struct tm tm;
-    localtime_r(&tt, &tm);
-    char dest[PATH_MAX];
-    strftime(dest, sizeof dest, DEST_BASE "/%Y%m%d_%H%M%S", &tm);
-    mkdir(DEST_BASE, 0755);
-    mkdir(dest, 0755);
-
     struct stat st;
-    if (lstat(MOUNT_POINT, &st) == 0)
+    char dev_to_mount[PATH_MAX];
+
+    /* Start with the base node, e.g. "/dev/sda" */
+    if (snprintf(dev_to_mount, sizeof(dev_to_mount), "%s", disk_devnode) >= (int)sizeof(dev_to_mount))
     {
-        if (!S_ISDIR(st.st_mode))
-        {
-            unlink(MOUNT_POINT);
-            mkdir(MOUNT_POINT, 0755); 
-        }
+        fprintf(stderr, "disk_devnode too long: %s\n", disk_devnode);
+        return -1;
+    }
+
+    /* Try partition "1": "/dev/sda1" (safe append) */
+    size_t len = strlen(dev_to_mount);
+    if (len + 1 < sizeof(dev_to_mount))
+    { /* +1 for '1', +1 for '\0' */
+        dev_to_mount[len] = '1';
+        dev_to_mount[len + 1] = '\0';
     }
     else
     {
-        mkdir(MOUNT_POINT, 0755); 
+        /* Name is already too long to add '1' safely, fall back to whole disk */
+        fprintf(stderr, "Cannot append '1' to %s safely, using whole disk\n", dev_to_mount);
     }
 
-    wait_for_clean_mountpoint(); 
-
-    /* 4) mount & copy */
-    lfs_pid = start_lfs(devnode);
-
-    if (wait_for_file(MOUNT_POINT, BIN_NAME, 5000) != 0)
+    /* If "/dev/sda1" (or whatever) doesn’t exist, fall back to the base disk node */
+    if (stat(dev_to_mount, &st) != 0)
     {
-        fprintf(stderr, "imu_log.bin did not appear within 5s - aborting copy\n");
-        umount_mp(MOUNT_POINT);
-        wait_for_clean_mountpoint(); 
-        free(devnode);
-        return;
+        /* fallback: just use disk_devnode as-is */
+        if (snprintf(dev_to_mount, sizeof(dev_to_mount), "%s", disk_devnode) >= (int)sizeof(dev_to_mount))
+        {
+            fprintf(stderr, "disk_devnode too long (fallback): %s\n", disk_devnode);
+            return -1;
+        }
     }
 
-    if (copy_tree(MOUNT_POINT, dest) != 0)
+    if (ensure_dir(MOUNT_POINT) != 0)
     {
-        fprintf(stderr, " X copy error\n"); 
+        return -1;
     }
 
-    if (is_fuse_mounted(MOUNT_POINT))
+    ensure_unmounted(MOUNT_POINT);
+
+    char *av[] = {"mount", "-t", "exfat", dev_to_mount, MOUNT_POINT, NULL};
+    int rc = run_child(av);
+    if (rc != 0)
     {
-        umount_mp(MOUNT_POINT);
-        wait_for_clean_mountpoint(); 
+        fprintf(stderr, "mount exfat %s -> %s failed (rc=%d)\n",
+                dev_to_mount, MOUNT_POINT, rc);
+        return -1;
     }
 
-    free(devnode);
+    if (out_dev && out_sz > 0)
+    {
+        strncpy(out_dev, dev_to_mount, out_sz);
+        out_dev[out_sz - 1] = '\0';
+    }
 
-    /* 5) convert and publish then archive */
-    convert_and_publish(dest);
+    return 0;
 }
 
-int main(void)
+/* ===================== COPY + DELETE LOG FILES =================== */
+
+static int copy_file(const char *src, const char *dst)
 {
-    signal(SIGCHLD, reap);
-    signal(SIGINT, forward_quit);
-    signal(SIGTERM, forward_quit);
-
-    struct udev *udev = udev_new();
-    struct udev_monitor *mon = udev_monitor_new_from_netlink(udev, "udev");
-    udev_monitor_filter_add_match_subsystem_devtype(mon, "usb", "usb_device");
-    udev_monitor_enable_receiving(mon);
-    int fd = udev_monitor_get_fd(mon);
-
-    printf("Waiting for USB %s:%s ...\n", VENDOR_ID, PRODUCT_ID);
-
-    while (!quit_flag)
+    FILE *in = fopen(src, "rb");
+    if (!in)
     {
-        /* debounce removal */
-        if (debouncing && remove_seen_at_ms > 0 && now_ms() - remove_seen_at_ms > 500)
-        {
-            debouncing = 0;
-            current_usb_path[0] = 0;
-            puts("Device removed, idle");
-        }
+        fprintf(stderr, "Failed to open %s for read: %s\n", src, strerror(errno));
+        return -1;
+    }
 
-        struct pollfd pfd = {fd, POLLIN, 0};
-        if (poll(&pfd, 1, 1000) <= 0)
+    FILE *out = fopen(dst, "wb");
+    if (!out)
+    {
+        fprintf(stderr, "Failed to open %s for write: %s\n", dst, strerror(errno));
+        fclose(in);
+        return -1;
+    }
+
+    uint8_t buf[4096];
+    size_t n;
+    int rc = 0;
+
+    while ((n = fread(buf, 1, sizeof(buf), in)) > 0)
+    {
+        if (fwrite(buf, 1, n, out) != n)
+        {
+            fprintf(stderr, "Write error to %s: %s\n", dst, strerror(errno));
+            rc = -1;
+            break;
+        }
+    }
+
+    if (ferror(in))
+    {
+        fprintf(stderr, "Read error from %s\n", src);
+        rc = -1;
+    }
+
+    fclose(in);
+    if (fclose(out) != 0)
+    {
+        fprintf(stderr, "Close error on %s: %s\n", dst, strerror(errno));
+        rc = -1;
+    }
+
+    return rc;
+}
+
+/* Copy all *.BIN / *.bin from src_logs into dest_logs and delete them on card */
+static int copy_and_delete_logs(const char *src_logs, const char *dest_logs)
+{
+    if (ensure_dir(dest_logs) != 0)
+    {
+        return -1;
+    }
+
+    DIR *dir = opendir(src_logs);
+    if (!dir)
+    {
+        fprintf(stderr, "Cannot open logs directory %s: %s\n",
+                src_logs, strerror(errno));
+        return -1;
+    }
+
+    struct dirent *de;
+    int copied = 0;
+
+    while ((de = readdir(dir)) != NULL)
+    {
+        if (de->d_name[0] == '.')
         {
             continue;
         }
-        
+
+        const char *dot = strrchr(de->d_name, '.');
+        if (!dot || (strcmp(dot, ".BIN") != 0 && strcmp(dot, ".bin") != 0))
+        {
+            continue; /* ignore non-BIN files */
+        }
+
+        char src_path[PATH_MAX];
+        char dst_path[PATH_MAX];
+
+        if (join_path(src_logs, de->d_name, src_path, sizeof(src_path)) != 0 ||
+            join_path(dest_logs, de->d_name, dst_path, sizeof(dst_path)) != 0)
+        {
+            fprintf(stderr, "Path too long for %s\n", de->d_name);
+            continue;
+        }
+
+        printf("  Copying %s -> %s\n", src_path, dst_path);
+        if (copy_file(src_path, dst_path) == 0)
+        {
+            ++copied;
+            if (unlink(src_path) != 0)
+            {
+                fprintf(stderr, "  Warning: failed to delete %s: %s\n",
+                        src_path, strerror(errno));
+            }
+            else
+            {
+                printf("  Deleted %s from wearable\n", src_path);
+            }
+        }
+    }
+
+    closedir(dir);
+
+    if (copied == 0)
+    {
+        printf("No .BIN files found in %s\n", src_logs);
+    }
+    else
+    {
+        printf("Copied %d log file(s) from wearable.\n", copied);
+    }
+
+    return 0;
+}
+
+/* ======================== RECORD DECODE + MQTT =================== */
+
+static void decode_record(const uint8_t buf[RECORD_SIZE],
+                          uint32_t *timestamp_ms,
+                          float *pressure_pa,
+                          float acc[3],
+                          float gyr[3])
+{
+    uint32_t ts;
+    uint32_t p;
+    int16_t raw[6];
+
+    memcpy(&ts, buf, 4);
+    memcpy(&p, buf + 4, 4);
+
+    for (int i = 0; i < 6; i++)
+    {
+        memcpy(&raw[i], buf + 8 + 2 * i, 2);
+    }
+
+    *timestamp_ms = ts;
+    *pressure_pa = p / 100.0f;
+
+    acc[0] = raw[0] / IMU_SCALE;
+    acc[1] = raw[1] / IMU_SCALE;
+    acc[2] = raw[2] / IMU_SCALE;
+
+    gyr[0] = raw[3] / IMU_SCALE;
+    gyr[1] = raw[4] / IMU_SCALE;
+    gyr[2] = raw[5] / IMU_SCALE;
+}
+
+/* session_root is e.g. /home/.../extracted/20251118_102030 */
+static int convert_and_publish(const char *session_root)
+{
+    char logs_dir[PATH_MAX];
+
+    if (join_path(session_root, LOGS_SUBDIR, logs_dir, sizeof(logs_dir)) != 0)
+    {
+        fprintf(stderr, "Path too long for logs_dir\n");
+        return -1;
+    }
+
+    DIR *dir = opendir(logs_dir);
+    if (!dir)
+    {
+        fprintf(stderr, "convert_and_publish: cannot open %s: %s\n",
+                logs_dir, strerror(errno));
+        return -1;
+    }
+
+    /* Setup MQTT */
+    mosquitto_lib_init();
+    struct mosquitto *m = mosquitto_new(NULL, true, NULL);
+    if (!m)
+    {
+        fprintf(stderr, "mosquitto_new failed\n");
+        closedir(dir);
+        mosquitto_lib_cleanup();
+        return -1;
+    }
+
+    int rc = mosquitto_connect_async(m, MQTT_HOST, MQTT_PORT, 60);
+    if (rc != MOSQ_ERR_SUCCESS)
+    {
+        fprintf(stderr, "mosquitto_connect failed: %s\n",
+                mosquitto_strerror(rc));
+        mosquitto_destroy(m);
+        closedir(dir);
+        mosquitto_lib_cleanup();
+        return -1;
+    }
+
+    mosquitto_loop_start(m);
+
+    struct dirent *de;
+    int total_files = 0;
+    int total_records = 0;
+
+    while ((de = readdir(dir)) != NULL)
+    {
+        if (de->d_name[0] == '.')
+        {
+            continue;
+        }
+
+        const char *dot = strrchr(de->d_name, '.');
+        if (!dot || (strcmp(dot, ".BIN") != 0 && strcmp(dot, ".bin") != 0))
+        {
+            continue;
+        }
+
+        char file_path[PATH_MAX];
+        if (join_path(logs_dir, de->d_name, file_path, sizeof(file_path)) != 0)
+        {
+            fprintf(stderr, "Path too long for %s\n", de->d_name);
+            continue;
+        }
+
+        FILE *fp = fopen(file_path, "rb");
+        if (!fp)
+        {
+            fprintf(stderr, "Failed to open %s: %s\n", file_path, strerror(errno));
+            continue;
+        }
+
+        printf("Decoding %s ...\n", file_path);
+        ++total_files;
+
+        uint8_t buf[RECORD_SIZE];
+        size_t n;
+
+        while ((n = fread(buf, 1, RECORD_SIZE, fp)) == RECORD_SIZE)
+        {
+            uint32_t ts_ms;
+            float p_pa, acc[3], gyr[3];
+
+            decode_record(buf, &ts_ms, &p_pa, acc, gyr);
+
+            char payload[256];
+            int len = snprintf(payload, sizeof(payload),
+                               "{\"timestamp_ms\":%u,"
+                               "\"pressure_pa\":%.2f,"
+                               "\"acceleration\":[%.2f,%.2f,%.2f],"
+                               "\"gyroscope\":[%.2f,%.2f,%.2f]}",
+                               ts_ms, p_pa,
+                               acc[0], acc[1], acc[2],
+                               gyr[0], gyr[1], gyr[2]);
+
+            if (len < 0 || (size_t)len >= sizeof(payload))
+            {
+                fprintf(stderr, "Payload truncated for timestamp %u\n", ts_ms);
+                continue;
+            }
+
+            if (len > 0 && (size_t)len < sizeof(payload))
+            {
+                /* Print the JSON we are about to publish */
+                printf("MQTT JSON -> %s\n", payload);
+                fflush(stdout); /* helpful if running under systemd */
+            }
+
+            rc = mosquitto_publish(m, NULL, MQTT_TOPIC,
+                                   (int)len, payload, 0, false);
+            if (rc != MOSQ_ERR_SUCCESS)
+            {
+                fprintf(stderr, "mosquitto_publish failed: %s\n",
+                        mosquitto_strerror(rc));
+            }
+            else
+            {
+                ++total_records;
+            }
+        }
+
+        if (ferror(fp))
+        {
+            fprintf(stderr, "Read error in %s\n", file_path);
+        }
+
+        fclose(fp);
+    }
+
+    closedir(dir);
+
+    mosquitto_loop_stop(m, true);
+    mosquitto_disconnect(m);
+    mosquitto_destroy(m);
+    mosquitto_lib_cleanup();
+
+    printf("Published %d records from %d file(s) for session %s\n",
+           total_records, total_files, session_root);
+
+    return 0;
+}
+
+/* ============================= ARCHIVE =========================== */
+
+static int archive_session(const char *session_root)
+{
+    if (ensure_dir(ARCHIVE_BASE) != 0)
+    {
+        return -1;
+    }
+
+    const char *name = strrchr(session_root, '/');
+    name = name ? name + 1 : session_root;
+
+    char dst[PATH_MAX];
+    if (join_path(ARCHIVE_BASE, name, dst, sizeof(dst)) != 0)
+    {
+        fprintf(stderr, "archive path too long\n");
+        return -1;
+    }
+
+    if (rename(session_root, dst) != 0)
+    {
+        fprintf(stderr, "Failed to move %s -> %s: %s\n",
+                session_root, dst, strerror(errno));
+        return -1;
+    }
+
+    printf("Archived session to %s\n", dst);
+    return 0;
+}
+
+/* ============================= UDEV WAIT ========================= */
+
+static int wait_for_device(struct udev_monitor *mon,
+                           const char *target_action,
+                           char *out_devnode,
+                           size_t out_sz)
+{
+    int fd = udev_monitor_get_fd(mon);
+    struct pollfd fds[1] = {
+        {.fd = fd, .events = POLLIN}};
+
+    for (;;)
+    {
+        if (quit_flag)
+        {
+            return -1;
+        }
+
+        int ret = poll(fds, 1, -1);
+        if (ret < 0)
+        {
+            if (errno == EINTR && quit_flag)
+            {
+                return -1;
+            }
+            if (errno == EINTR)
+            {
+                continue;
+            }
+            perror("poll");
+            return -1;
+        }
+
+        if (!(fds[0].revents & POLLIN))
+        {
+            continue;
+        }
+
         struct udev_device *dev = udev_monitor_receive_device(mon);
         if (!dev)
         {
             continue;
         }
-    
-        const char *act = udev_device_get_action(dev),
-                   *vid = udev_device_get_sysattr_value(dev, "idVendor"),
-                   *pid = udev_device_get_sysattr_value(dev, "idProduct"),
-                   *spath = udev_device_get_syspath(dev);
 
-        if (!debouncing && act && vid && pid && !strcmp(act, "add") && !strcmp(vid, VENDOR_ID) && !strcmp(pid, PRODUCT_ID))
+        const char *action = udev_device_get_action(dev);
+        const char *subsys = udev_device_get_subsystem(dev);
+        const char *devtype = udev_device_get_devtype(dev);
+
+        const char *vid = udev_device_get_property_value(dev, "ID_VENDOR_ID");
+        const char *pid = udev_device_get_property_value(dev, "ID_MODEL_ID");
+        const char *node = udev_device_get_devnode(dev);
+
+        if (action && !strcmp(action, target_action) &&
+            subsys && !strcmp(subsys, "block") &&
+            devtype && !strcmp(devtype, "disk") &&
+            vid && pid &&
+            !strcasecmp(vid, WEARABLE_VENDOR_HEX) &&
+            !strcasecmp(pid, WEARABLE_PRODUCT_HEX))
         {
-            puts("Wearable detected - processing");
-            handle_device(udev);
-            puts("Waiting for removal ...");
-            strncpy(current_usb_path, spath, sizeof current_usb_path - 1);
-            debouncing = 1;
-            remove_seen_at_ms = 0;
-        }
-        else if (debouncing && act && !strcmp(act, "remove") && !strcmp(spath, current_usb_path))
-        {
-            remove_seen_at_ms = now_ms();
+
+            printf("  udev: %s event for %s (VID=%s PID=%s)\n",
+                   target_action,
+                   node ? node : "(unknown)",
+                   vid, pid);
+
+            if (out_devnode && out_sz > 0 && node)
+            {
+                strncpy(out_devnode, node, out_sz);
+                out_devnode[out_sz - 1] = '\0';
+            }
+
+            udev_device_unref(dev);
+            return 0;
         }
 
         udev_device_unref(dev);
     }
+}
 
-    puts("Shutdown requested");
+/* ============================= HANDLER =========================== */
+
+static void handle_device(const char *disk_devnode)
+{
+    /* 1) Mount exFAT from this disk */
+    char mounted_dev[PATH_MAX];
+    if (mount_exfat(disk_devnode, mounted_dev, sizeof(mounted_dev)) != 0)
+    {
+        fprintf(stderr, "Failed to mount %s as exFAT\n", disk_devnode);
+        return;
+    }
+
+    /* 2) Wait for /mnt/wearable/logs to exist */
+    char src_logs[PATH_MAX];
+    if (join_path(MOUNT_POINT, LOGS_SUBDIR, src_logs, sizeof(src_logs)) != 0)
+    {
+        fprintf(stderr, "src_logs path too long\n");
+        ensure_unmounted(MOUNT_POINT);
+        return;
+    }
+
+    struct stat st;
+    int tries = 50; /* ~5s */
+    while (tries-- > 0)
+    {
+        if (stat(src_logs, &st) == 0 && S_ISDIR(st.st_mode))
+        {
+            break;
+        }
+        usleep(100 * 1000);
+    }
+    if (tries <= 0)
+    {
+        fprintf(stderr, "Timed out waiting for %s\n", src_logs);
+        ensure_unmounted(MOUNT_POINT);
+        return;
+    }
+
+    /* 3) Prepare destination session directory */
+    char session_dir[PATH_MAX];
+    if (make_session_dir(session_dir, sizeof(session_dir)) != 0)
+    {
+        fprintf(stderr, "Failed to create session directory\n");
+        ensure_unmounted(MOUNT_POINT);
+        return;
+    }
+
+    char dest_logs[PATH_MAX];
+    if (join_path(session_dir, LOGS_SUBDIR, dest_logs, sizeof(dest_logs)) != 0)
+    {
+        fprintf(stderr, "dest_logs path too long\n");
+        ensure_unmounted(MOUNT_POINT);
+        return;
+    }
+
+    printf("Session dir: %s\n", session_dir);
+
+    /* 4) Copy + delete log files from wearable */
+    if (copy_and_delete_logs(src_logs, dest_logs) != 0)
+    {
+        fprintf(stderr, "Error copying log files\n");
+    }
+
+    /* 5) Unmount as early as possible */
+    ensure_unmounted(MOUNT_POINT);
+
+    /* 6) Decode + publish over MQTT */
+    convert_and_publish(session_dir);
+
+    /* 7) Archive session folder */
+    archive_session(session_dir);
+}
+
+/* =============================== MAIN ============================ */
+
+int main(void)
+{
+    signal(SIGINT, handle_sigint);
+    signal(SIGTERM, handle_sigint);
+
+    struct udev *udev = udev_new();
+    if (!udev)
+    {
+        fprintf(stderr, "udev_new() failed\n");
+        return 1;
+    }
+
+    struct udev_monitor *mon =
+        udev_monitor_new_from_netlink(udev, "udev");
+    if (!mon)
+    {
+        fprintf(stderr, "udev_monitor_new_from_netlink() failed\n");
+        udev_unref(udev);
+        return 1;
+    }
+
+    udev_monitor_filter_add_match_subsystem_devtype(mon, "block", NULL);
+    udev_monitor_enable_receiving(mon);
+
+    char disk_devnode[PATH_MAX];
+
+    while (!quit_flag)
+    {
+        printf("Waiting for USB %s:%s ...\n",
+               WEARABLE_VENDOR_HEX, WEARABLE_PRODUCT_HEX);
+
+        if (wait_for_device(mon, "add",
+                            disk_devnode, sizeof(disk_devnode)) != 0)
+        {
+            if (quit_flag)
+                break;
+            fprintf(stderr, "wait_for_device(add) failed\n");
+            break;
+        }
+        if (quit_flag)
+            break;
+
+        printf("Wearable detected - processing\n");
+        handle_device(disk_devnode);
+
+        printf("Waiting for removal ...\n");
+        if (wait_for_device(mon, "remove", NULL, 0) != 0)
+        {
+            if (quit_flag)
+                break;
+            fprintf(stderr, "wait_for_device(remove) failed\n");
+            break;
+        }
+        printf("Device removed, ready for next.\n");
+    }
+
+    udev_monitor_unref(mon);
+    udev_unref(udev);
     return 0;
 }
