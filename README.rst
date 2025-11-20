@@ -24,6 +24,10 @@ You have to install dfu-util to perform DFU from application::
 
     sudo apt-get install dfu-util
 
+Since native Raspberry Pi OS does not support exFAT file system, you need to install the following support and mount manually::
+
+    sudo apt install exfat-fuse exfatprogs
+
 Finally, you need to follow `this instructions <https://github.com/littlefs-project/littlefs-fuse>`_ for littlefs-fuse in order to use lfs to extract data.
 
 3. Running the Programme
