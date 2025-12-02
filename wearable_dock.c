@@ -2,7 +2,7 @@
  * wearable_dock.c: exFAT logs extractor + IMU to JSON to MQTT
  *
  * Compile:
- *   cc -Wall -O2 wearable_dock.c -ludev -lmosquitto -o wearable_dock_run
+ *   cc -Wall -DDS_HOME_DIR='"t-89-e0-5c"' -O2 wearable_dock.c -ludev -lmosquitto -o wearable_dock_run
  */
 
 #define _GNU_SOURCE
@@ -37,7 +37,11 @@
 #define MOUNT_POINT "/mnt/wearable"
 
 /* Where to store offloaded sessions */
-#define SESSIONS_BASE "/home/torus-4/wearable_dock/extracted"
+#ifndef DS_HOME_DIR
+#define DS_HOME_DIR "t-89-e0-5c"
+#endif
+
+#define SESSIONS_BASE "/home/" DS_HOME_DIR "/wearable_dock/extracted"
 #define ARCHIVE_BASE SESSIONS_BASE "/archive"
 
 /* Subdirectory created by firmware on the card */
@@ -51,9 +55,10 @@
 /* Binary record from firmware:
  *   uint32_t timestamp_ms;
  *   uint32_t pressure_pa;
+ *   uint8_t  label;
  *   int16_t  imu[6];
  */
-#define RECORD_SIZE (4 + 4 + 6 * 2)
+#define RECORD_SIZE (4 + 4 + 1 + 6 * 2)
 #define IMU_SCALE 100.0f
 
 static volatile sig_atomic_t quit_flag = 0;
@@ -346,23 +351,27 @@ static int copy_and_delete_logs(const char *src_logs, const char *dest_logs)
 static void decode_record(const uint8_t buf[RECORD_SIZE],
                           uint32_t *timestamp_ms,
                           float *pressure_pa,
+                          uint8_t *ml_label, 
                           float acc[3],
                           float gyr[3])
 {
     uint32_t ts;
     uint32_t p;
+    uint8_t label; 
     int16_t raw[6];
 
     memcpy(&ts, buf, 4);
     memcpy(&p, buf + 4, 4);
+    memcpy(&label, buf + 8, 1); 
 
     for (int i = 0; i < 6; i++)
     {
-        memcpy(&raw[i], buf + 8 + 2 * i, 2);
+        memcpy(&raw[i], buf + 9 + 2 * i, 2);
     }
 
     *timestamp_ms = ts;
     *pressure_pa = p / 100.0f;
+    *ml_label = label; 
 
     acc[0] = raw[0] / IMU_SCALE;
     acc[1] = raw[1] / IMU_SCALE;
@@ -456,17 +465,19 @@ static int convert_and_publish(const char *session_root)
         while ((n = fread(buf, 1, RECORD_SIZE, fp)) == RECORD_SIZE)
         {
             uint32_t ts_ms;
+            uint8_t ml_la; 
             float p_pa, acc[3], gyr[3];
 
-            decode_record(buf, &ts_ms, &p_pa, acc, gyr);
+            decode_record(buf, &ts_ms, &p_pa, &ml_la, acc, gyr);
 
             char payload[256];
             int len = snprintf(payload, sizeof(payload),
                                "{\"timestamp_ms\":%u,"
                                "\"pressure_pa\":%.2f,"
+                               "\"predicted\":%u,"
                                "\"acceleration\":[%.2f,%.2f,%.2f],"
                                "\"gyroscope\":[%.2f,%.2f,%.2f]}",
-                               ts_ms, p_pa,
+                               ts_ms, p_pa, ml_la,
                                acc[0], acc[1], acc[2],
                                gyr[0], gyr[1], gyr[2]);
 
