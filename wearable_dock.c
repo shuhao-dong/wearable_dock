@@ -38,7 +38,7 @@
 
 /* Where to store offloaded sessions */
 #ifndef DS_HOME_DIR
-#define DS_HOME_DIR "t-89-e0-5c"
+#define DS_HOME_DIR "raspberrypi"
 #endif
 
 #define SESSIONS_BASE "/home/" DS_HOME_DIR "/wearable_dock/extracted"
